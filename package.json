@@ -1,0 +1,18 @@
+{
+  "name": "eyes-monorepo",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "scripts": {
+    "dev:frontend": "cd frontend && next dev",
+    "dev:backend": "cd backend && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000",
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "lint": "cd frontend && next lint",
+    "test": "cd backend && pytest"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}
