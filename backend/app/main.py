@@ -257,20 +257,49 @@ def characterize_pupil(contour: np.ndarray) -> tuple[float, float, float]:
     return float(diameter), float(circularity), float(area)
 
 
-def assess_pupil(diameter: float, circularity: float) -> tuple[PupilAssessment, List[str]]:
-    warnings: List[str] = []
+def build_pupil_assessment(
+    diameter: float,
+    circularity: float,
+    *,
+    ratio: Optional[float] = None,
+    offset_norm: Optional[float] = None,
+    rms_dev: Optional[float] = None,
+    circle_radius: Optional[float] = None,
+) -> tuple[PupilAssessment, List[str]]:
+    """
+    isTooSmall: only when pupil/iris ratio is below typical (small pupil vs iris).
+    isTooLarge: absolute diameter (px) and/or high pupil/iris ratio.
+    isIrregular: only decentering vs detected iris (offset_norm).
+    """
+    typical_min, typical_max = 0.15, 0.55
+    centering_threshold = 0.15
+    shape_circularity_cutoff = 0.82
+    rms_rel_threshold = 0.10
 
-    # Relaxed thresholds: only flag clear extremes
-    too_small = diameter < 20
+    too_small = ratio is not None and ratio < typical_min
     too_large = diameter > 140
-    irregular = circularity < 0.65
+    if ratio is not None and ratio > typical_max:
+        too_large = True
 
+    rms_rel = 0.0
+    if rms_dev is not None and circle_radius is not None and circle_radius > 1e-6:
+        rms_rel = rms_dev / circle_radius
+
+    irregular_shape = circularity < shape_circularity_cutoff or rms_rel > rms_rel_threshold
+    irregular_prop = ratio is not None and (ratio < typical_min or ratio > typical_max)
+    irregular_center = offset_norm is not None and offset_norm >= centering_threshold
+
+    warnings: List[str] = []
     if too_small:
-        warnings.append("Pupil appears relatively small in this image.")
+        warnings.append("Pupil looks small relative to the iris (low pupil/iris ratio).")
     if too_large:
         warnings.append("Pupil appears relatively large in this image.")
-    if irregular:
-        warnings.append("Pupil outline appears somewhat irregular.")
+    if irregular_shape:
+        warnings.append("Pupil outline deviates noticeably from a perfect circle.")
+    if irregular_prop:
+        warnings.append("Pupil/iris proportion looks atypical for this view.")
+    if irregular_center:
+        warnings.append("Pupil center appears offset relative to the iris.")
 
     if not warnings:
         warnings.append("Pupil size and shape look within a typical range for this image.")
@@ -278,9 +307,8 @@ def assess_pupil(diameter: float, circularity: float) -> tuple[PupilAssessment, 
     assessment = PupilAssessment(
         isTooLarge=too_large,
         isTooSmall=too_small,
-        isIrregular=irregular,
+        isIrregular=irregular_center,
     )
-
     return assessment, warnings
 
 
@@ -315,7 +343,6 @@ async def analyze_eye(file: UploadFile = File(...)) -> JSONResponse:
         return JSONResponse(content=response.model_dump())
 
     diameter, circularity, area = characterize_pupil(contour)
-    assessment, warnings = assess_pupil(diameter, circularity)
 
     pupil_points = sample_contour_points(contour, 64)
     pts_arr = contour.reshape(-1, 2)
@@ -335,28 +362,59 @@ async def analyze_eye(file: UploadFile = File(...)) -> JSONResponse:
     iris_points: Optional[List[Point2D]] = None
     proportionality: Optional[ProportionalityAssessment] = None
 
-    # Iris ring: derive from pupil so proportion is stable (pupil/iris ≈ 0.28–0.40)
-    # Typical iris is ~2.5–3.5× pupil radius; use 3.0 so ratio ≈ 0.33
     pupil_r = float(radius)
-    iris_r = pupil_r / 0.33
-    theta = np.linspace(0, 2 * np.pi, 64, endpoint=False)
-    iris_points = [
-        Point2D(x=float(cx + iris_r * np.cos(t)), y=float(cy + iris_r * np.sin(t)))
-        for t in theta
-    ]
-    ratio = pupil_r / iris_r if iris_r > 0 else None
-    if ratio is not None:
-        # Relaxed band: normal 0.15–0.55; only flag clear miosis/mydriasis
-        typical_min, typical_max = 0.15, 0.55
-        is_prop = typical_min <= ratio <= typical_max
-        proportionality = ProportionalityAssessment(
-            pupilToIrisRatio=round(ratio, 3),
-            isProportional=is_prop,
-            note=(
-                f"Pupil/iris ratio {ratio:.1%} (iris derived from pupil for consistency). "
-                + ("Within typical range." if is_prop else "Outside typical range; consider clinical follow-up if concerned.")
-            ),
-        )
+    ratio: Optional[float] = None
+    offset_norm: Optional[float] = None
+    iris_contour = detect_iris(gray, cx, cy, pupil_r)
+
+    if iris_contour is not None and len(iris_contour) >= 3:
+        ic = iris_contour.reshape(-1, 2)
+        (ix, iy), iris_r = cv2.minEnclosingCircle(ic.astype(np.float32))
+        iris_r = float(iris_r)
+        if iris_r > pupil_r * 1.05:
+            ratio = pupil_r / iris_r
+            offset_norm = float(np.hypot(cx - ix, cy - iy) / iris_r)
+            iris_points = sample_contour_points(iris_contour, 64)
+            typical_min, typical_max = 0.15, 0.55
+            is_prop = typical_min <= ratio <= typical_max
+            proportionality = ProportionalityAssessment(
+                pupilToIrisRatio=round(ratio, 3),
+                isProportional=is_prop,
+                note=(
+                    f"Pupil/iris ratio {ratio:.1%} from detected iris boundary. "
+                    + ("Within typical range." if is_prop else "Outside typical range for this heuristic.")
+                ),
+            )
+
+    if iris_points is None:
+        # Fallback: synthetic concentric iris when CV does not find a boundary
+        iris_r = pupil_r / 0.33
+        theta = np.linspace(0, 2 * np.pi, 64, endpoint=False)
+        iris_points = [
+            Point2D(x=float(cx + iris_r * np.cos(t)), y=float(cy + iris_r * np.sin(t)))
+            for t in theta
+        ]
+        ratio = pupil_r / iris_r if iris_r > 0 else None
+        if ratio is not None:
+            typical_min, typical_max = 0.15, 0.55
+            is_prop = typical_min <= ratio <= typical_max
+            proportionality = ProportionalityAssessment(
+                pupilToIrisRatio=round(ratio, 3),
+                isProportional=is_prop,
+                note=(
+                    f"Pupil/iris ratio {ratio:.1%} (estimated ring; adjust iris in the UI if needed). "
+                    + ("Within typical range." if is_prop else "Outside typical range for this heuristic.")
+                ),
+            )
+
+    assessment, warnings = build_pupil_assessment(
+        diameter,
+        circularity,
+        ratio=ratio,
+        offset_norm=offset_norm,
+        rms_dev=rms_dev,
+        circle_radius=float(radius),
+    )
 
     _, jpeg = cv2.imencode(".jpg", gray)
     processed_b64 = "data:image/jpeg;base64," + base64.b64encode(jpeg.tobytes()).decode("utf-8")
