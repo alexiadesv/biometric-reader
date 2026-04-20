@@ -45,10 +45,18 @@ type AnalysisResponse = {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 
-function getIrisRadiusFromPoints(centerX: number, centerY: number, points: Point2D[]): number {
-  if (!points.length) return 0;
-  const p = points[0];
-  return Math.hypot(p.x - centerX, p.y - centerY);
+/** Centroid + mean radial distance — matches detected iris geometry (backend uses min-enclosing circle center). */
+function getIrisCenterAndRadiusFromPoints(points: Point2D[]): { center: Point2D; radius: number } | null {
+  if (!points.length) return null;
+  const n = points.length;
+  const cx = points.reduce((s, p) => s + p.x, 0) / n;
+  const cy = points.reduce((s, p) => s + p.y, 0) / n;
+  let sumR = 0;
+  for (const p of points) {
+    sumR += Math.hypot(p.x - cx, p.y - cy);
+  }
+  const radius = sumR / n;
+  return { center: { x: cx, y: cy }, radius };
 }
 
 function escapeCsvCell(value: string): string {
@@ -103,12 +111,13 @@ export default function HomePage() {
 
   const pupilCenter = result?.fittedCircle ? { x: result.fittedCircle.centerX, y: result.fittedCircle.centerY } : null;
   const pupilRadius = result?.fittedCircle?.radius ?? 0;
-  const initialIrisRadius = useMemo(() => {
-    if (!result?.irisPoints?.length || !pupilCenter) return 0;
-    return getIrisRadiusFromPoints(pupilCenter.x, pupilCenter.y, result.irisPoints);
-  }, [result?.irisPoints, pupilCenter]);
+  const initialIrisGeometry = useMemo(() => {
+    if (!result?.irisPoints?.length) return null;
+    return getIrisCenterAndRadiusFromPoints(result.irisPoints);
+  }, [result?.irisPoints]);
+  const initialIrisRadius = initialIrisGeometry?.radius ?? 0;
   const irisRadius = adjustedIrisRadius ?? initialIrisRadius;
-  const irisCenter = adjustedIrisCenter ?? pupilCenter;
+  const irisCenter = adjustedIrisCenter ?? initialIrisGeometry?.center ?? pupilCenter;
 
   const irisPointsForDisplay = useMemo(() => {
     if (!irisCenter || irisRadius <= 0) return result?.irisPoints ?? [];
@@ -154,11 +163,8 @@ export default function HomePage() {
     if (manualProportion && manualProportion.ratio > typicalMax) {
       isTooLarge = true;
     }
-    // Irregular = decentering only (API + live centering vs adjusted iris).
-    let isIrregular = result.assessment.isIrregular;
-    if (centering && centering.normalized >= 0.15) {
-      isIrregular = true;
-    }
+    // Irregular pill = same rule as "Pupil centering (vs iris)" — decentering only, live with adjusted iris.
+    const isIrregular = !!(centering && centering.normalized >= 0.15);
     return { isTooLarge, isTooSmall, isIrregular };
   }, [result, manualProportion, centering]);
 
@@ -392,7 +398,7 @@ export default function HomePage() {
             <header className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-8">
               <div>
                 <h1 className="text-2xl md:text-3xl font-bold tracking-tight bg-gradient-to-r from-slate-800 via-sky-600 to-violet-600 bg-clip-text text-transparent">
-                  Eye Metrics Analyzer
+                  Ocular Biomarker Analyzer
                 </h1>
                 <p className="mt-2 text-sm md:text-base text-ink-muted max-w-xl leading-relaxed">
                   Upload a clear photo of a single eye. We&apos;ll normalize it, estimate pupil size
