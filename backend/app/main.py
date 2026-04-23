@@ -205,11 +205,13 @@ def detect_pupil(gray: np.ndarray) -> tuple[Optional[np.ndarray], str]:
         dist = np.hypot(cx - img_cx, cy - img_cy)
         if dist > max_dist_from_center:
             return False, 0, 0, 0
-        perimeter = cv2.arcLength(c, True)
-        if perimeter == 0:
+        pts = c.reshape(-1, 2)
+        if len(pts) < 5:
             return False, 0, 0, 0
-        circularity = 4 * np.pi * area / (perimeter * perimeter)
-        if circularity < 0.65:
+        ellipse = cv2.fitEllipse(c)
+        (_, (ma, MA), _) = ellipse
+        circularity = float(min(ma, MA) / max(ma, MA)) if max(ma, MA) > 0 else 0.0
+        if circularity < 0.5:
             return False, 0, 0, 0
         return True, area, circularity, dist
 
@@ -249,8 +251,14 @@ def detect_pupil(gray: np.ndarray) -> tuple[Optional[np.ndarray], str]:
 
 def characterize_pupil(contour: np.ndarray) -> tuple[float, float, float]:
     area = cv2.contourArea(contour)
-    perimeter = cv2.arcLength(contour, True)
-    circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0.0
+
+    pts = contour.reshape(-1, 2)
+    if len(pts) >= 5:
+        ellipse = cv2.fitEllipse(contour)
+        (_, (ma, MA), _) = ellipse
+        circularity = float(min(ma, MA) / max(ma, MA)) if max(ma, MA) > 0 else 0.0
+    else:
+        circularity = 0.0
 
     (x, y), radius = cv2.minEnclosingCircle(contour)
     diameter = float(radius * 2.0)
@@ -273,7 +281,7 @@ def build_pupil_assessment(
     """
     typical_min, typical_max = 0.15, 0.55
     centering_threshold = 0.15
-    shape_circularity_cutoff = 0.82
+    shape_circularity_cutoff = 0.85
     rms_rel_threshold = 0.10
 
     too_small = ratio is not None and ratio < typical_min
