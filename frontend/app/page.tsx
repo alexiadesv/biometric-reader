@@ -8,6 +8,7 @@ type PupilAssessment = {
   isTooLarge: boolean;
   isTooSmall: boolean;
   isIrregular: boolean;
+  isOccludedByLid: boolean;
 };
 
 type Point2D = { x: number; y: number };
@@ -41,6 +42,9 @@ type AnalysisResponse = {
   imageWidth?: number | null;
   imageHeight?: number | null;
   processedImageBase64?: string | null;
+  upperLidPoints?: Point2D[] | null;
+  lowerLidPoints?: Point2D[] | null;
+  pupilVisiblePercent?: number | null;
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
@@ -71,6 +75,56 @@ function rowsToCsv(dataRows: Array<[string, string]>): string {
   return `${header}\n${body}`;
 }
 
+function computePupilVisiblePercent(
+  pupilCx: number,
+  pupilCy: number,
+  pupilR: number,
+  upperPts: Point2D[],
+  lowerPts: Point2D[],
+): number {
+  if (pupilR <= 0) return 0;
+  const N = 100;
+  const xVals: number[] = [];
+  for (let i = 0; i <= N; i++) xVals.push(pupilCx - pupilR + (2 * pupilR * i) / N);
+
+  function interpY(pts: Point2D[], x: number): number | null {
+    if (pts.length < 2) return null;
+    if (x < pts[0].x || x > pts[pts.length - 1].x) return null;
+    let lo = 0,
+      hi = pts.length - 1;
+    while (lo < hi - 1) {
+      const mid = (lo + hi) >> 1;
+      if (pts[mid].x <= x) lo = mid;
+      else hi = mid;
+    }
+    const span = pts[hi].x - pts[lo].x;
+    const frac = span ? (x - pts[lo].x) / span : 0;
+    return pts[lo].y + frac * (pts[hi].y - pts[lo].y);
+  }
+
+  let visArea = 0,
+    totArea = 0;
+  for (let i = 0; i < N; i++) {
+    const xMid = (xVals[i] + xVals[i + 1]) / 2;
+    const dx = xVals[i + 1] - xVals[i];
+    const off = xMid - pupilCx;
+    if (Math.abs(off) >= pupilR) continue;
+    const halfH = Math.sqrt(pupilR * pupilR - off * off);
+    const pTop = pupilCy - halfH;
+    const pBot = pupilCy + halfH;
+    let vTop = pTop,
+      vBot = pBot;
+    const uy = interpY(upperPts, xMid);
+    if (uy !== null) vTop = Math.max(vTop, uy);
+    const ly = interpY(lowerPts, xMid);
+    if (ly !== null) vBot = Math.min(vBot, ly);
+    visArea += Math.max(0, vBot - vTop) * dx;
+    totArea += 2 * halfH * dx;
+  }
+  if (totArea <= 0) return 0;
+  return Math.max(0, Math.min(100, (100 * visArea) / totArea));
+}
+
 function triggerCsvDownload(filename: string, csvContent: string) {
   const bom = "\uFEFF";
   const blob = new Blob([bom + csvContent], { type: "text/csv;charset=utf-8" });
@@ -93,8 +147,14 @@ export default function HomePage() {
   const [result, setResult] = useState<AnalysisResponse | null>(null);
   const [adjustedIrisRadius, setAdjustedIrisRadius] = useState<number | null>(null);
   const [adjustedIrisCenter, setAdjustedIrisCenter] = useState<Point2D | null>(null);
+  const [upperLidOffset, setUpperLidOffset] = useState(0);
+  const [upperLidOffsetX, setUpperLidOffsetX] = useState(0);
+  const [lowerLidOffset, setLowerLidOffset] = useState(0);
+  const [lowerLidOffsetX, setLowerLidOffsetX] = useState(0);
+  const [upperLidAngle, setUpperLidAngle] = useState(0);
+  const [lowerLidAngle, setLowerLidAngle] = useState(0);
   const svgRef = useRef<SVGSVGElement>(null);
-  const dragModeRef = useRef<"radius" | "center" | null>(null);
+  const dragModeRef = useRef<"radius" | "center" | "upper-lid" | "lower-lid" | "upper-lid-rotate" | "lower-lid-rotate" | null>(null);
   const dragPointerIdRef = useRef<number | null>(null);
   const windowDragListenersRef = useRef<{
     move: (e: PointerEvent) => void;
@@ -129,6 +189,46 @@ export default function HomePage() {
     return pts;
   }, [irisCenter, irisRadius, result?.irisPoints]);
 
+  const upperLidDisplay = useMemo(() => {
+    if (!result?.upperLidPoints?.length) return [];
+    const pts = result.upperLidPoints;
+    const midIdx = Math.floor(pts.length / 2);
+    const cx = pts[midIdx].x + upperLidOffsetX;
+    const cy = pts[midIdx].y + upperLidOffset;
+    const cos = Math.cos(upperLidAngle);
+    const sin = Math.sin(upperLidAngle);
+    return pts.map((p) => {
+      const dx = p.x + upperLidOffsetX - cx;
+      const dy = p.y + upperLidOffset - cy;
+      return { x: cx + dx * cos - dy * sin, y: cy + dx * sin + dy * cos };
+    });
+  }, [result?.upperLidPoints, upperLidOffset, upperLidOffsetX, upperLidAngle]);
+
+  const lowerLidDisplay = useMemo(() => {
+    if (!result?.lowerLidPoints?.length) return [];
+    const pts = result.lowerLidPoints;
+    const midIdx = Math.floor(pts.length / 2);
+    const cx = pts[midIdx].x + lowerLidOffsetX;
+    const cy = pts[midIdx].y + lowerLidOffset;
+    const cos = Math.cos(lowerLidAngle);
+    const sin = Math.sin(lowerLidAngle);
+    return pts.map((p) => {
+      const dx = p.x + lowerLidOffsetX - cx;
+      const dy = p.y + lowerLidOffset - cy;
+      return { x: cx + dx * cos - dy * sin, y: cy + dx * sin + dy * cos };
+    });
+  }, [result?.lowerLidPoints, lowerLidOffset, lowerLidOffsetX, lowerLidAngle]);
+
+  const pupilVisiblePercent = useMemo(() => {
+    if (!pupilCenter || pupilRadius <= 0) return result?.pupilVisiblePercent ?? null;
+    const hasLidAdjustment = upperLidOffset !== 0 || upperLidOffsetX !== 0 || lowerLidOffset !== 0 || lowerLidOffsetX !== 0 || upperLidAngle !== 0 || lowerLidAngle !== 0;
+    if (!hasLidAdjustment) return result?.pupilVisiblePercent ?? null;
+    if (!upperLidDisplay.length && !lowerLidDisplay.length) return result?.pupilVisiblePercent ?? null;
+    return Math.round(
+      computePupilVisiblePercent(pupilCenter.x, pupilCenter.y, pupilRadius, upperLidDisplay, lowerLidDisplay) * 10,
+    ) / 10;
+  }, [pupilCenter, pupilRadius, upperLidDisplay, lowerLidDisplay, upperLidOffset, upperLidOffsetX, lowerLidOffset, lowerLidOffsetX, upperLidAngle, lowerLidAngle, result?.pupilVisiblePercent]);
+
   const manualProportion = useMemo(() => {
     if (!pupilCenter || pupilRadius <= 0 || irisRadius <= 0) return null;
     const ratio = pupilRadius / irisRadius;
@@ -144,29 +244,27 @@ export default function HomePage() {
     const offsetPx = Math.hypot(dx, dy);
     const normalized = offsetPx / irisRadius;
     let label: string;
-    if (normalized < 0.15) label = "well centered";
-    else if (normalized < 0.30) label = "mildly decentered";
+    if (normalized < 0.25) label = "well centered";
+    else if (normalized < 0.40) label = "mildly decentered";
     else label = "markedly decentered";
     return { offsetPx, normalized, label };
   }, [pupilCenter, irisCenter, irisRadius]);
 
-  /** Merges API assessment with live pupil/iris ratio and centering (manual iris edits). */
   const effectiveAssessment = useMemo((): PupilAssessment | null => {
     if (!result) return null;
     const typicalMin = 0.15;
     const typicalMax = 0.55;
     let isTooLarge = result.assessment.isTooLarge;
-    // Small pill: pupil/iris ratio only (matches backend; ignores absolute pixel diameter).
     let isTooSmall = manualProportion
       ? manualProportion.ratio < typicalMin
       : result.assessment.isTooSmall;
     if (manualProportion && manualProportion.ratio > typicalMax) {
       isTooLarge = true;
     }
-    // Irregular pill = same rule as "Pupil centering (vs iris)" — decentering only, live with adjusted iris.
-    const isIrregular = !!(centering && centering.normalized >= 0.15);
-    return { isTooLarge, isTooSmall, isIrregular };
-  }, [result, manualProportion, centering]);
+    const isIrregular = !!(centering && centering.normalized >= 0.25);
+    const isOccludedByLid = pupilVisiblePercent != null && pupilVisiblePercent < 98;
+    return { isTooLarge, isTooSmall, isIrregular, isOccludedByLid };
+  }, [result, manualProportion, centering, pupilVisiblePercent]);
 
   dragStateRef.current = {
     pupilCenter,
@@ -185,7 +283,13 @@ export default function HomePage() {
     return svgPt ? { x: svgPt.x, y: svgPt.y } : null;
   }, []);
 
-  const applyIrisPointerMove = useCallback((clientX: number, clientY: number) => {
+  const lidDragStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const lidDragStartOffsetRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const lidRotatePivotRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const lidRotateStartAngleRef = useRef<number>(0);
+  const lidRotateBaseAngleRef = useRef<number>(0);
+
+  const applyPointerMove = useCallback((clientX: number, clientY: number) => {
     const mode = dragModeRef.current;
     const { pupilCenter: pc, irisCenter: ic, pupilRadius: pr } = dragStateRef.current;
     if (!mode || !pc) return;
@@ -196,11 +300,30 @@ export default function HomePage() {
       if (r > pr * 1.1 && r < 500) setAdjustedIrisRadius(r);
     } else if (mode === "center") {
       setAdjustedIrisCenter({ x: pt.x, y: pt.y });
+    } else if (mode === "upper-lid") {
+      const dx = pt.x - lidDragStartRef.current.x;
+      const dy = pt.y - lidDragStartRef.current.y;
+      setUpperLidOffsetX(lidDragStartOffsetRef.current.x + dx);
+      setUpperLidOffset(lidDragStartOffsetRef.current.y + dy);
+    } else if (mode === "lower-lid") {
+      const dx = pt.x - lidDragStartRef.current.x;
+      const dy = pt.y - lidDragStartRef.current.y;
+      setLowerLidOffsetX(lidDragStartOffsetRef.current.x + dx);
+      setLowerLidOffset(lidDragStartOffsetRef.current.y + dy);
+    } else if (mode === "upper-lid-rotate" || mode === "lower-lid-rotate") {
+      const pv = lidRotatePivotRef.current;
+      const curAngle = Math.atan2(pt.y - pv.y, pt.x - pv.x);
+      const delta = curAngle - lidRotateStartAngleRef.current;
+      const newAngle = lidRotateBaseAngleRef.current + delta;
+      if (mode === "upper-lid-rotate") setUpperLidAngle(newAngle);
+      else setLowerLidAngle(newAngle);
     }
   }, [clientToSvg]);
 
-  const startIrisDrag = useCallback(
-    (e: React.PointerEvent, mode: "radius" | "center") => {
+  type DragMode = "radius" | "center" | "upper-lid" | "lower-lid" | "upper-lid-rotate" | "lower-lid-rotate";
+
+  const startDrag = useCallback(
+    (e: React.PointerEvent, mode: DragMode, pivot?: { x: number; y: number }) => {
       e.preventDefault();
       e.stopPropagation();
       if (dragPointerIdRef.current != null) return;
@@ -213,9 +336,24 @@ export default function HomePage() {
       dragPointerIdRef.current = e.pointerId;
       dragModeRef.current = mode;
 
+      if (mode === "upper-lid" || mode === "lower-lid") {
+        const pt = clientToSvg(e.clientX, e.clientY);
+        lidDragStartRef.current = { x: pt?.x ?? 0, y: pt?.y ?? 0 };
+        lidDragStartOffsetRef.current = mode === "upper-lid"
+          ? { x: upperLidOffsetX, y: upperLidOffset }
+          : { x: lowerLidOffsetX, y: lowerLidOffset };
+      }
+
+      if ((mode === "upper-lid-rotate" || mode === "lower-lid-rotate") && pivot) {
+        const pt = clientToSvg(e.clientX, e.clientY);
+        lidRotatePivotRef.current = pivot;
+        lidRotateStartAngleRef.current = pt ? Math.atan2(pt.y - pivot.y, pt.x - pivot.x) : 0;
+        lidRotateBaseAngleRef.current = mode === "upper-lid-rotate" ? upperLidAngle : lowerLidAngle;
+      }
+
       const onMove = (ev: PointerEvent) => {
         if (ev.pointerId !== dragPointerIdRef.current) return;
-        applyIrisPointerMove(ev.clientX, ev.clientY);
+        applyPointerMove(ev.clientX, ev.clientY);
       };
       const onUp = (ev: PointerEvent) => {
         if (ev.pointerId !== dragPointerIdRef.current) return;
@@ -236,7 +374,7 @@ export default function HomePage() {
       window.addEventListener("pointerup", onUp);
       window.addEventListener("pointercancel", onUp);
     },
-    [applyIrisPointerMove]
+    [applyPointerMove, clientToSvg, upperLidOffset, upperLidOffsetX, lowerLidOffset, lowerLidOffsetX, upperLidAngle, lowerLidAngle]
   );
 
   useEffect(() => {
@@ -254,20 +392,34 @@ export default function HomePage() {
   }, []);
 
   const summary = useMemo(() => {
-    if (!result) return "No analysis yet.";
-    let text =
-      result.warnings.length === 0
-        ? "Pupil appears within expected range based on this heuristic check (non-medical)."
-        : result.warnings.join(" ");
-    const manual = adjustedIrisRadius != null || adjustedIrisCenter != null;
-    if (manual && manualProportion && !manualProportion.isProportional) {
-      text += " With your iris adjustment, pupil/iris proportion reads as atypical.";
+    if (!result || !effectiveAssessment) return "No analysis yet.";
+    const parts: string[] = [];
+
+    if (effectiveAssessment.isTooSmall) {
+      parts.push("Miosis: pupil appears constricted relative to the iris.");
     }
-    if (manual && centering && centering.normalized >= 0.15) {
-      text += " With your iris adjustment, pupil centering vs iris suggests decentration.";
+    if (effectiveAssessment.isTooLarge) {
+      parts.push("Mydriasis: pupil appears dilated.");
     }
-    return text;
-  }, [result, manualProportion, centering, adjustedIrisRadius, adjustedIrisCenter]);
+
+    const shapeWarnings = result.warnings.filter(
+      (w) => w.toLowerCase().includes("distortion") || w.toLowerCase().includes("perfect circle") || w.toLowerCase().includes("deviates"),
+    );
+    parts.push(...shapeWarnings);
+
+    if (effectiveAssessment.isIrregular) {
+      parts.push("Corectopia: pupil center appears displaced relative to the iris.");
+    }
+    if (effectiveAssessment.isOccludedByLid && pupilVisiblePercent != null) {
+      parts.push(`Pupil dips under the eyelid (${pupilVisiblePercent.toFixed(1)}% visible).`);
+    }
+
+    if (parts.length === 0) {
+      parts.push("Pupil appears within expected range based on this heuristic check (non-medical).");
+    }
+
+    return parts.join(" ");
+  }, [result, effectiveAssessment, pupilVisiblePercent]);
 
   const handleDownloadResultsCsv = useCallback(() => {
     if (!result) return;
@@ -325,6 +477,8 @@ export default function HomePage() {
     }
 
     rows.push(
+      ["pupil_visible_percent", pupilVisiblePercent != null ? pupilVisiblePercent.toFixed(1) : ""],
+      ["eyelid_manually_adjusted", (upperLidOffset !== 0 || upperLidOffsetX !== 0 || lowerLidOffset !== 0 || lowerLidOffsetX !== 0 || upperLidAngle !== 0 || lowerLidAngle !== 0) ? "yes" : "no"],
       ["summary_text", summary],
       ["api_warnings_pipe_separated", result.warnings.join(" | ")],
       ["processing_notes", result.processingNotes ?? ""],
@@ -344,6 +498,13 @@ export default function HomePage() {
     adjustedIrisCenter,
     irisCenter,
     irisRadius,
+    pupilVisiblePercent,
+    upperLidOffset,
+    upperLidOffsetX,
+    lowerLidOffset,
+    lowerLidOffsetX,
+    upperLidAngle,
+    lowerLidAngle,
   ]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -378,6 +539,12 @@ export default function HomePage() {
       setResult(data);
       setAdjustedIrisRadius(null);
       setAdjustedIrisCenter(null);
+      setUpperLidOffset(0);
+      setUpperLidOffsetX(0);
+      setLowerLidOffset(0);
+      setLowerLidOffsetX(0);
+      setUpperLidAngle(0);
+      setLowerLidAngle(0);
     } catch (err: any) {
       console.error(err);
       setError(
@@ -513,7 +680,7 @@ export default function HomePage() {
                                 opacity={0.9}
                                 cursor="grab"
                                 style={{ touchAction: "none" }}
-                                onPointerDown={(e) => startIrisDrag(e, "center")}
+                                onPointerDown={(e) => startDrag(e, "center")}
                                 aria-label="Drag to move iris circle"
                               />
                               <circle
@@ -526,18 +693,143 @@ export default function HomePage() {
                                 opacity={0.95}
                                 cursor="grab"
                                 style={{ touchAction: "none" }}
-                                onPointerDown={(e) => startIrisDrag(e, "radius")}
+                                onPointerDown={(e) => startDrag(e, "radius")}
                                 aria-label="Drag to resize iris circle"
                               />
                             </>
                           )}
+                          {upperLidDisplay.length > 1 && (() => {
+                            const mid = Math.floor(upperLidDisplay.length / 2);
+                            const pivot = { x: upperLidDisplay[mid].x, y: upperLidDisplay[mid].y };
+                            return (
+                              <>
+                                <polyline
+                                  points={upperLidDisplay.map((p) => `${p.x},${p.y}`).join(" ")}
+                                  fill="none"
+                                  stroke="rgb(244 63 94)"
+                                  strokeWidth={1.8}
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  opacity={0.85}
+                                  pointerEvents="none"
+                                />
+                                <circle
+                                  cx={pivot.x}
+                                  cy={pivot.y}
+                                  r={7}
+                                  fill="rgb(244 63 94)"
+                                  stroke="white"
+                                  strokeWidth={1.5}
+                                  opacity={0.9}
+                                  cursor="move"
+                                  style={{ touchAction: "none" }}
+                                  onPointerDown={(e) => startDrag(e, "upper-lid")}
+                                  aria-label="Drag to move upper eyelid line"
+                                />
+                                <rect
+                                  x={upperLidDisplay[0].x - 5}
+                                  y={upperLidDisplay[0].y - 5}
+                                  width={10}
+                                  height={10}
+                                  rx={2}
+                                  fill="rgb(244 63 94)"
+                                  stroke="white"
+                                  strokeWidth={1.5}
+                                  opacity={0.9}
+                                  cursor="grab"
+                                  style={{ touchAction: "none" }}
+                                  onPointerDown={(e) => startDrag(e, "upper-lid-rotate", pivot)}
+                                  aria-label="Drag to rotate upper eyelid line"
+                                />
+                                <rect
+                                  x={upperLidDisplay[upperLidDisplay.length - 1].x - 5}
+                                  y={upperLidDisplay[upperLidDisplay.length - 1].y - 5}
+                                  width={10}
+                                  height={10}
+                                  rx={2}
+                                  fill="rgb(244 63 94)"
+                                  stroke="white"
+                                  strokeWidth={1.5}
+                                  opacity={0.9}
+                                  cursor="grab"
+                                  style={{ touchAction: "none" }}
+                                  onPointerDown={(e) => startDrag(e, "upper-lid-rotate", pivot)}
+                                  aria-label="Drag to rotate upper eyelid line"
+                                />
+                              </>
+                            );
+                          })()}
+                          {lowerLidDisplay.length > 1 && (() => {
+                            const mid = Math.floor(lowerLidDisplay.length / 2);
+                            const pivot = { x: lowerLidDisplay[mid].x, y: lowerLidDisplay[mid].y };
+                            return (
+                              <>
+                                <polyline
+                                  points={lowerLidDisplay.map((p) => `${p.x},${p.y}`).join(" ")}
+                                  fill="none"
+                                  stroke="rgb(244 63 94)"
+                                  strokeWidth={1.8}
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  opacity={0.85}
+                                  pointerEvents="none"
+                                />
+                                <circle
+                                  cx={pivot.x}
+                                  cy={pivot.y}
+                                  r={7}
+                                  fill="rgb(244 63 94)"
+                                  stroke="white"
+                                  strokeWidth={1.5}
+                                  opacity={0.9}
+                                  cursor="move"
+                                  style={{ touchAction: "none" }}
+                                  onPointerDown={(e) => startDrag(e, "lower-lid")}
+                                  aria-label="Drag to move lower eyelid line"
+                                />
+                                <rect
+                                  x={lowerLidDisplay[0].x - 5}
+                                  y={lowerLidDisplay[0].y - 5}
+                                  width={10}
+                                  height={10}
+                                  rx={2}
+                                  fill="rgb(244 63 94)"
+                                  stroke="white"
+                                  strokeWidth={1.5}
+                                  opacity={0.9}
+                                  cursor="grab"
+                                  style={{ touchAction: "none" }}
+                                  onPointerDown={(e) => startDrag(e, "lower-lid-rotate", pivot)}
+                                  aria-label="Drag to rotate lower eyelid line"
+                                />
+                                <rect
+                                  x={lowerLidDisplay[lowerLidDisplay.length - 1].x - 5}
+                                  y={lowerLidDisplay[lowerLidDisplay.length - 1].y - 5}
+                                  width={10}
+                                  height={10}
+                                  rx={2}
+                                  fill="rgb(244 63 94)"
+                                  stroke="white"
+                                  strokeWidth={1.5}
+                                  opacity={0.9}
+                                  cursor="grab"
+                                  style={{ touchAction: "none" }}
+                                  onPointerDown={(e) => startDrag(e, "lower-lid-rotate", pivot)}
+                                  aria-label="Drag to rotate lower eyelid line"
+                                />
+                              </>
+                            );
+                          })()}
                         </svg>
                         <div className="absolute bottom-2 left-2 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-ink-muted bg-white/95 backdrop-blur-sm rounded-md px-2 py-1 border border-line shadow-sm">
                           <span><span className="inline-block w-2 h-2 rounded-full bg-cyan-400 mr-1" />Pupil</span>
                           <span><span className="inline-block w-2 h-2 rounded-full bg-amber-400 mr-1" />Iris</span>
                           <span className="text-sky-400">— Fitted circle</span>
+                          {(upperLidDisplay.length > 0 || lowerLidDisplay.length > 0) && (
+                            <span><span className="inline-block w-2 h-2 rounded-full bg-rose-500 mr-1" />Eyelid</span>
+                          )}
                           {result?.irisPoints?.length ? (
-                            <span className="text-amber-600/90">· Drag center to move iris, edge dot to resize</span>
+                            <span className="text-amber-600/90">· Drag handles to adjust iris/lids</span>
                           ) : null}
                         </div>
                       </div>
@@ -631,9 +923,9 @@ export default function HomePage() {
 
                   {hasResult && centering && (
                     <div className={`mt-3 rounded-xl border-2 px-3 py-3 text-xs space-y-1 shadow-sm ${
-                      centering.normalized < 0.15
+                      centering.normalized < 0.25
                         ? "border-emerald-300 bg-gradient-to-br from-emerald-50 via-teal-50/80 to-cyan-50/50 ring-2 ring-emerald-200/50"
-                        : centering.normalized < 0.30
+                        : centering.normalized < 0.40
                           ? "border-slate-200 bg-gradient-to-br from-white to-slate-50/90 ring-1 ring-slate-200/60"
                           : "border-rose-300 bg-gradient-to-br from-rose-50 via-orange-50/70 to-amber-50/40 ring-2 ring-rose-200/50"
                     }`}>
@@ -641,13 +933,38 @@ export default function HomePage() {
                       <p className="text-ink-muted">
                         Offset: {centering.offsetPx.toFixed(1)} px ({centering.normalized.toFixed(2)}× iris radius)
                         <span className={`ml-1 font-medium ${
-                          centering.normalized < 0.15 ? "text-emerald-800" : centering.normalized < 0.30 ? "text-ink-muted" : "text-rose-700"
+                          centering.normalized < 0.25 ? "text-emerald-800" : centering.normalized < 0.40 ? "text-ink-muted" : "text-rose-700"
                         }`}>
                           — {centering.label}
                         </span>
                       </p>
                       <p className="text-[11px] text-ink-faint mt-0.5">
                         How far the pupil center is from the iris center. Adjust the iris circle to match the eye, then read this.
+                      </p>
+                    </div>
+                  )}
+
+                  {hasResult && pupilVisiblePercent != null && (
+                    <div className={`mt-3 rounded-xl border-2 px-3 py-3 text-xs space-y-1 shadow-sm ${
+                      pupilVisiblePercent >= 90
+                        ? "border-emerald-300 bg-gradient-to-br from-emerald-50 via-teal-50/80 to-cyan-50/50 ring-2 ring-emerald-200/50"
+                        : pupilVisiblePercent >= 60
+                          ? "border-slate-200 bg-gradient-to-br from-white to-slate-50/90 ring-1 ring-slate-200/60"
+                          : "border-rose-300 bg-gradient-to-br from-rose-50 via-orange-50/70 to-amber-50/40 ring-2 ring-rose-200/50"
+                    }`}>
+                      <p className="font-medium text-ink">Pupil visible</p>
+                      <p className="text-ink-muted">
+                        {pupilVisiblePercent.toFixed(1)}% of pupil area is between the eyelid lines
+                        <span className={`ml-1 font-medium ${
+                          pupilVisiblePercent >= 90 ? "text-emerald-800" : pupilVisiblePercent >= 60 ? "text-ink-muted" : "text-rose-700"
+                        }`}>
+                          — {pupilVisiblePercent >= 90 ? "fully exposed" : pupilVisiblePercent >= 60 ? "partially occluded" : "significantly occluded"}
+                        </span>
+                      </p>
+                      <p className="text-[11px] text-ink-faint mt-0.5">
+                        {upperLidOffset !== 0 || upperLidOffsetX !== 0 || lowerLidOffset !== 0 || lowerLidOffsetX !== 0 || upperLidAngle !== 0 || lowerLidAngle !== 0
+                          ? "Eyelid lines adjusted manually. Drag circle to move, squares to rotate."
+                          : "Auto-detected eyelid edges. Drag circle to move, squares to rotate."}
                       </p>
                     </div>
                   )}
@@ -663,7 +980,7 @@ export default function HomePage() {
                       </p>
                     )}
                     {hasResult && effectiveAssessment && (
-                      <ul className="mt-1 grid grid-cols-3 gap-1.5 text-[11px]">
+                      <ul className="mt-1 grid grid-cols-4 gap-1.5 text-[11px]">
                         <li
                           className={`rounded-full border px-2 py-1 text-center font-medium transition-shadow ${
                             effectiveAssessment.isTooLarge
@@ -690,6 +1007,15 @@ export default function HomePage() {
                           }`}
                         >
                           Irregular
+                        </li>
+                        <li
+                          className={`rounded-full border px-2 py-1 text-center font-medium transition-shadow ${
+                            effectiveAssessment.isOccludedByLid
+                              ? "border-2 border-rose-400 bg-gradient-to-r from-rose-500 to-pink-500 text-white shadow-md shadow-rose-400/35 ring-2 ring-rose-200 ring-offset-2 ring-offset-white"
+                              : "border border-slate-200/90 bg-gradient-to-b from-white to-slate-50 text-slate-400"
+                          }`}
+                        >
+                          Lid dip
                         </li>
                       </ul>
                     )}
