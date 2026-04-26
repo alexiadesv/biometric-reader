@@ -831,16 +831,12 @@ export default function HomePage() {
                             );
                           })()}
                         </svg>
-                        <div className="absolute bottom-2 left-2 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-ink-muted bg-white/95 backdrop-blur-sm rounded-md px-2 py-1 border border-line shadow-sm">
-                          <span><span className="inline-block w-2 h-2 rounded-full bg-cyan-400 mr-1" />Pupil</span>
-                          <span><span className="inline-block w-2 h-2 rounded-full bg-amber-400 mr-1" />Iris</span>
-                          <span className="text-sky-400">— Fitted circle</span>
+                        <div className="absolute top-1.5 right-1.5 flex flex-wrap gap-x-2 gap-y-0.5 text-[9px] text-ink-muted bg-white/80 backdrop-blur-sm rounded px-1.5 py-0.5 border border-line/50 shadow-sm pointer-events-none">
+                          <span><span className="inline-block w-1.5 h-1.5 rounded-full bg-cyan-400 mr-0.5" />Pupil</span>
+                          <span><span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 mr-0.5" />Iris</span>
                           {(upperLidDisplay.length > 0 || lowerLidDisplay.length > 0) && (
-                            <span><span className="inline-block w-2 h-2 rounded-full bg-rose-500 mr-1" />Eyelid</span>
+                            <span><span className="inline-block w-1.5 h-1.5 rounded-full bg-rose-500 mr-0.5" />Lid</span>
                           )}
-                          {result?.irisPoints?.length ? (
-                            <span className="text-amber-600/90">· Drag handles to adjust iris/lids</span>
-                          ) : null}
                         </div>
                       </div>
                     ) : preview ? (
