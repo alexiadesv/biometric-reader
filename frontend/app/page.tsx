@@ -590,13 +590,23 @@ export default function HomePage() {
                       Use a sharp, well-lit close-up of one eye. Avoid heavy reflections or
                       sunglasses.
                     </p>
-                    <label className="mt-2 flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-sky-200/80 bg-gradient-to-br from-white to-sky-50/60 px-4 py-6 text-center transition-all hover:border-sky-400 hover:from-sky-50 hover:to-cyan-50 hover:shadow-md hover:shadow-sky-200/40">
-                      <span className="text-sm font-medium text-ink">
-                        {file ? file.name : "Click to choose a file"}
-                      </span>
-                      <span className="text-xs text-ink-faint">
-                        PNG, JPG or HEIC up to ~10 MB
-                      </span>
+                    <label className="mt-2 flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-sky-200/80 bg-gradient-to-br from-white to-sky-50/60 px-4 py-4 text-center transition-all hover:border-sky-400 hover:from-sky-50 hover:to-cyan-50 hover:shadow-md hover:shadow-sky-200/40 overflow-hidden">
+                      {preview ? (
+                        <div className="flex flex-col items-center gap-2 w-full">
+                          <img
+                            src={preview}
+                            alt="Selected eye photo"
+                            className="max-h-32 max-w-full rounded-lg object-contain shadow-sm border border-sky-100"
+                          />
+                          <span className="text-xs font-medium text-ink truncate max-w-full">{file?.name}</span>
+                          <span className="text-[11px] text-ink-faint">Click to change</span>
+                        </div>
+                      ) : (
+                        <>
+                          <span className="text-sm font-medium text-ink">Click to choose a file</span>
+                          <span className="text-xs text-ink-faint">PNG, JPG or HEIC up to ~10 MB</span>
+                        </>
+                      )}
                       <input
                         type="file"
                         accept="image/*"
