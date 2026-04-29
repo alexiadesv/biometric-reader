@@ -28,6 +28,7 @@ class PupilAssessment(BaseModel):
     isTooLarge: bool
     isTooSmall: bool
     isIrregular: bool
+    isOccludedByLid: bool = False
 
 
 class ProportionalityAssessment(BaseModel):
@@ -43,7 +44,6 @@ class AnalysisResponse(BaseModel):
     warnings: List[str]
     assessment: PupilAssessment
     processingNotes: Optional[str] = None
-    # New: plot points and circle comparison
     pupilPoints: Optional[List[Point2D]] = None
     irisPoints: Optional[List[Point2D]] = None
     fittedCircle: Optional[FittedCircle] = None
@@ -52,6 +52,9 @@ class AnalysisResponse(BaseModel):
     imageWidth: Optional[int] = None
     imageHeight: Optional[int] = None
     processedImageBase64: Optional[str] = None
+    upperLidPoints: Optional[List[Point2D]] = None
+    lowerLidPoints: Optional[List[Point2D]] = None
+    pupilVisiblePercent: Optional[float] = None
 
 
 app = FastAPI(title="Eye Metrics Analyzer API")
@@ -120,6 +123,134 @@ def fit_circle_and_deviation(points: np.ndarray) -> Tuple[float, float, float, f
     rms = float(np.sqrt(np.mean(deviations ** 2)))
     max_dev = float(np.max(deviations))
     return cx, cy, radius, rms, max_dev
+
+
+def detect_eyelid_edges(
+    gray: np.ndarray,
+    center_x: float,
+    center_y: float,
+    radius: float,
+    n_points: int = 32,
+) -> Tuple[Optional[List[Point2D]], Optional[List[Point2D]]]:
+    """Detect upper/lower eyelid edges and fit parabolic curves (y = a(x-cx)^2 + b)."""
+    h, w = gray.shape
+
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    grad_y = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=5)
+    grad_mag = np.abs(grad_y)
+
+    x_left = max(0, int(center_x - radius * 1.3))
+    x_right = min(w - 1, int(center_x + radius * 1.3))
+    # Oversample for a better parabola fit
+    x_positions = np.linspace(x_left, x_right, n_points * 2, dtype=int)
+
+    upper_raw: List[Tuple[float, float]] = []
+    lower_raw: List[Tuple[float, float]] = []
+
+    for x_pos in x_positions:
+        x = int(x_pos)
+        if x < 0 or x >= w:
+            continue
+
+        y_top = max(0, int(center_y - radius * 1.8))
+        y_upper_end = max(0, int(center_y - radius * 0.3))
+        if y_top < y_upper_end:
+            col = grad_mag[y_top:y_upper_end, x]
+            if len(col) > 3:
+                best_idx = int(np.argmax(col))
+                upper_raw.append((float(x), float(y_top + best_idx)))
+
+        y_lower_start = min(h - 1, int(center_y + radius * 0.3))
+        y_bottom = min(h - 1, int(center_y + radius * 1.8))
+        if y_lower_start < y_bottom:
+            col = grad_mag[y_lower_start:y_bottom, x]
+            if len(col) > 3:
+                best_idx = int(np.argmax(col))
+                lower_raw.append((float(x), float(y_lower_start + best_idx)))
+
+    def _fit_parabola(
+        pts: List[Tuple[float, float]], cx: float, curvature_sign: float,
+    ) -> Optional[List[Point2D]]:
+        """Least-squares fit y = a*(x-cx)^2 + b, enforce sign of *a*, return smooth curve."""
+        if len(pts) < 3:
+            return None
+        xs = np.array([p[0] for p in pts])
+        ys = np.array([p[1] for p in pts])
+        X = (xs - cx) ** 2
+        A = np.column_stack([X, np.ones_like(X)])
+        coeffs, _, _, _ = np.linalg.lstsq(A, ys, rcond=None)
+        a, b = float(coeffs[0]), float(coeffs[1])
+        if curvature_sign < 0 and a > 0:
+            a = -abs(a)
+        elif curvature_sign > 0 and a < 0:
+            a = abs(a)
+        x_out = np.linspace(float(xs.min()), float(xs.max()), n_points)
+        y_out = a * (x_out - cx) ** 2 + b
+        return [Point2D(x=float(xv), y=float(yv)) for xv, yv in zip(x_out, y_out)]
+
+    upper = _fit_parabola(upper_raw, center_x, curvature_sign=1.0)
+    lower = _fit_parabola(lower_raw, center_x, curvature_sign=-1.0)
+    return upper, lower
+
+
+def compute_pupil_visible_percent(
+    pupil_cx: float,
+    pupil_cy: float,
+    pupil_r: float,
+    upper_lid: Optional[List[Point2D]],
+    lower_lid: Optional[List[Point2D]],
+) -> float:
+    """Fraction of the pupil circle area visible between the two lid curves (0-100)."""
+    if pupil_r <= 0:
+        return 0.0
+
+    n_slices = 100
+    x_vals = np.linspace(pupil_cx - pupil_r, pupil_cx + pupil_r, n_slices + 1)
+
+    def _interp_y(pts: Optional[List[Point2D]], x: float) -> Optional[float]:
+        if not pts or len(pts) < 2:
+            return None
+        xs = [p.x for p in pts]
+        ys = [p.y for p in pts]
+        if x < xs[0] or x > xs[-1]:
+            return None
+        idx = int(np.searchsorted(xs, x, side="right")) - 1
+        idx = max(0, min(idx, len(xs) - 2))
+        span = xs[idx + 1] - xs[idx]
+        frac = (x - xs[idx]) / span if span else 0.0
+        return ys[idx] + frac * (ys[idx + 1] - ys[idx])
+
+    visible_area = 0.0
+    total_area = 0.0
+
+    for i in range(n_slices):
+        x_mid = (x_vals[i] + x_vals[i + 1]) / 2
+        dx = float(x_vals[i + 1] - x_vals[i])
+        off = x_mid - pupil_cx
+        if abs(off) >= pupil_r:
+            continue
+        half_h = np.sqrt(pupil_r ** 2 - off ** 2)
+        p_top = pupil_cy - half_h
+        p_bot = pupil_cy + half_h
+        total_slice = 2 * half_h
+
+        vis_top = p_top
+        vis_bot = p_bot
+
+        uy = _interp_y(upper_lid, x_mid)
+        if uy is not None:
+            vis_top = max(vis_top, uy)
+
+        ly = _interp_y(lower_lid, x_mid)
+        if ly is not None:
+            vis_bot = min(vis_bot, ly)
+
+        visible_area += max(0.0, vis_bot - vis_top) * dx
+        total_area += total_slice * dx
+
+    if total_area <= 0:
+        return 0.0
+    return max(0.0, min(100.0, 100.0 * visible_area / total_area))
 
 
 def detect_iris(gray: np.ndarray, pupil_cx: float, pupil_cy: float, pupil_r: float) -> Optional[np.ndarray]:
@@ -280,7 +411,7 @@ def build_pupil_assessment(
     isIrregular: only decentering vs detected iris (offset_norm).
     """
     typical_min, typical_max = 0.15, 0.55
-    centering_threshold = 0.15
+    centering_threshold = 0.25
     shape_circularity_cutoff = 0.85
     rms_rel_threshold = 0.10
 
@@ -299,15 +430,15 @@ def build_pupil_assessment(
 
     warnings: List[str] = []
     if too_small:
-        warnings.append("Pupil looks small relative to the iris (low pupil/iris ratio).")
+        warnings.append("Miosis: pupil appears constricted relative to the iris (low pupil/iris ratio).")
     if too_large:
-        warnings.append("Pupil appears relatively large in this image.")
+        warnings.append("Mydriasis: pupil appears dilated in this image.")
     if irregular_shape:
-        warnings.append("Pupil outline deviates noticeably from a perfect circle.")
+        warnings.append("Pupil distortion: outline deviates noticeably from a perfect circle.")
     if irregular_prop:
         warnings.append("Pupil/iris proportion looks atypical for this view.")
     if irregular_center:
-        warnings.append("Pupil center appears offset relative to the iris.")
+        warnings.append("Corectopia: pupil center appears displaced relative to the iris.")
 
     if not warnings:
         warnings.append("Pupil size and shape look within a typical range for this image.")
@@ -415,6 +546,22 @@ async def analyze_eye(file: UploadFile = File(...)) -> JSONResponse:
                 ),
             )
 
+    # Eyelid edge detection — use iris geometry when available, else scaled pupil
+    _iris_detected = iris_contour is not None and len(iris_contour) >= 3
+    if _iris_detected:
+        _ic = iris_contour.reshape(-1, 2)
+        (_lix, _liy), _lir = cv2.minEnclosingCircle(_ic.astype(np.float32))
+        lid_ref_cx, lid_ref_cy, lid_ref_r = float(_lix), float(_liy), float(_lir)
+    else:
+        lid_ref_cx, lid_ref_cy, lid_ref_r = cx, cy, pupil_r * 2.5
+    upper_lid, lower_lid = detect_eyelid_edges(gray, lid_ref_cx, lid_ref_cy, lid_ref_r)
+
+    pupil_vis_pct: Optional[float] = None
+    if upper_lid or lower_lid:
+        pupil_vis_pct = round(
+            compute_pupil_visible_percent(cx, cy, pupil_r, upper_lid, lower_lid), 1
+        )
+
     assessment, warnings = build_pupil_assessment(
         diameter,
         circularity,
@@ -444,6 +591,9 @@ async def analyze_eye(file: UploadFile = File(...)) -> JSONResponse:
         imageWidth=img_w,
         imageHeight=img_h,
         processedImageBase64=processed_b64,
+        upperLidPoints=upper_lid,
+        lowerLidPoints=lower_lid,
+        pupilVisiblePercent=pupil_vis_pct,
     )
 
     return JSONResponse(content=response.model_dump())
